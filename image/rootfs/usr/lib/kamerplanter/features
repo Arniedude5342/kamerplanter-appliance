@@ -1,0 +1,17 @@
+# What this release of the Kamerplanter appliance understands, one feature
+# per line, read by other releases of the appliance from this release's
+# deployment (/sysroot/ostree/deploy/*/deploy/*/usr/lib/kamerplanter/features)
+# before they act on its behalf. Only ever add lines; a missing file means a
+# release older than all of them.
+#
+# backup-locations: the guard finds a pre-update backup wherever the record
+#   in /var/lib/kamerplanter/update/backups/ says it is (backup disk, data
+#   disk or system disk), and verifies its checksum before restoring it.
+backup-locations
+#
+# data-disk: the release uses a data disk that is set up
+#   (/var/lib/kamerplanter/disks/data.env) and binds its locations, so it runs
+#   on the data on that disk. A manual rollback to a release without it is
+#   refused while a data disk is set up; an automatic one returns a move onto
+#   the data disk that is not verified yet to the copy on the system disk.
+data-disk

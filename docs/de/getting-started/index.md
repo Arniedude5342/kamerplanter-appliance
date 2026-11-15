@@ -3,7 +3,7 @@ title: Erste Schritte
 audience: [maintainer]
 content_mode: tutorial
 track: developer-docs
-last_updated: 2026-11-13
+last_updated: 2026-11-15
 ---
 
 # Erste Schritte
@@ -30,6 +30,13 @@ task disk:package  # komprimiertes Disk-Image und Prüfsummen in .build/dist/
 ```
 
 `task test:boot` gibt je Lauf eine Zeile aus und legt die serielle Konsole und eine Diagnose jedes gescheiterten Laufs unter `.build/boot/` ab. Der erste Start jedes Laufs lädt die Container-Images aus ihren Registries und dauert mehrere Minuten.
+
+Die VM-Tests (`task test:boot`, `task test:update`, `task test:data-disk`) laufen auch auf GitHub Actions, verteilt auf parallele Jobs, über den Workflow `vm-tests`: in einem Pull Request, sobald er das Label `vm-tests` trägt (und erneut bei jedem Push darauf), nach jedem Merge nach `develop`, der `image/`, `build/` oder `tests/boot/` ändert, und von Hand unter **Actions → vm-tests → Run workflow**. Die Zusammenfassung des Laufs listet jedes Ergebnis; die Ergebnisdateien und seriellen Konsolen hängen am Lauf.
+
+## Die Appliance betreiben
+
+- [Updates und Rollback](updates.md) — wie sich die Appliance selbst aktualisiert und zum vorherigen Release zurückkehrt
+- [Datenträger und Sicherungs-Datenträger](data-disk.md) — Daten und die Sicherungen vor Updates auf eigenen lokalen Platten halten
 
 ## Aufräumen
 

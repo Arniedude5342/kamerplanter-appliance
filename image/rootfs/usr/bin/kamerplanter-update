@@ -13,12 +13,21 @@
 #   kamerplanter-update resume            end a postponement
 #   kamerplanter-update rollback          back to the previous version and the
 #                                         data from before the update
+#   kamerplanter-update allow-downgrade <disk release> <running release>
+#                                         as root: let the running release start
+#                                         the services on a data disk that the
+#                                         newer disk release has used (E13)
 #
 # Run on every boot by units, not by the user:
 #   guard    before the databases start: back up the data when a new version
-#            boots for the first time, restore it after a rollback
+#            boots for the first time, restore it after a rollback; then keep
+#            the services stopped on a data disk a newer release has used
 #   health   after the services start: decide whether a new version is
-#            healthy, and roll it back when it is not
+#            healthy, and roll it back when it is not; raise the release
+#            marker of the data disk once the services are healthy; after
+#            the data was moved onto a data disk, decide whether the
+#            services are healthy from it, and return to the copy on the
+#            system disk when they are not
 #
 # State in /var/lib/kamerplanter/update/:
 #   good        digest of the last version that passed its health check
@@ -26,21 +35,77 @@
 #               yet), checking (TO booted, data backed up under FROM, health
 #               not decided) or manual (rollback from TO to FROM requested)
 #   failed      digests that failed and are never applied again
-#   backup/D/   the volumes as they were when D was left
+#   backup/D/   on the system disk: the volumes as they were when D was left
+#   backups/D   where the backup of D is (LOCATION, and the UUID of its
+#               disk), its checksum (SHA256), when it was taken (TAKEN), and
+#               since when its deletion waits for its disk (DELETE_PENDING)
 #   log.jsonl   one JSON object per event
 #   postpone    epoch seconds until which no update is activated
+#   downgrades  "DISK RUNNING TIME" per allow-downgrade: the running release
+#               may use a data disk whose marker holds the newer DISK
+#
+# The pre-update backup of D goes to the first location that may take it and
+# has space for it (spec/update-and-rollback/ D8): update-backup/D/ on the
+# backup disk, else update-backup/D/ at the top of the data disk, else
+# backup/D/ above (backup_locations in /usr/lib/kamerplanter/env.sh). With an
+# encrypted data disk, only an encrypted backup disk, the data disk, or the
+# system disk while the key of the data disk is kept on it count. Wherever
+# the backup is, backups/D says so and holds the checksum verified before it
+# is restored (D10).
+# The disks count only when the release a rollback would return to finds a
+# backup there: its tree lists backup-locations in
+# /usr/lib/kamerplanter/features. An older release, or one that cannot be
+# determined, gets its backup on the system disk.
+#
+# On the data disk, when one is set up, the release marker "release"
+# (/usr/lib/kamerplanter/env.sh, data_disk_marker), and the backups written
+# to it; a copy of the marker is part of every backup (data-disk-release).
 set -euo pipefail
 umask 077
 
+# The update state stays on the system disk, also with a data disk
+# (spec/update-and-rollback/ D9).
 state=/var/lib/kamerplanter/update
+# With a data disk, each volume directory below is bound from it
+# (/usr/libexec/kamerplanter/disks), and /etc/kamerplanter as well; the paths
+# stay the same.
 volumes=/var/lib/containers/storage/volumes
 # Named volumes of the Quadlet units (image/rootfs/usr/share/containers/systemd/*.volume).
 data_volumes=(arangodb_data valkey_data)
 defaults=/usr/share/kamerplanter/kamerplanter.env
 user=/etc/kamerplanter/kamerplanter.env
 issue=/run/issue.d/50-kamerplanter.issue
+# The disk service, which keeps the record of a move onto the data disk.
+disks_tool=/usr/libexec/kamerplanter/disks
+# The deployments of the system image, each with its own tree (bootc/ostree).
+deployments=/sysroot/ostree/deploy
+# The console message of a refused data disk (release_check); before the
+# general one, after those of the disk service (40-kamerplanter-*-disk.issue).
+release_issue=/run/issue.d/45-kamerplanter-release.issue
+# The console message of a backup that is not restored (restore_refused).
+restore_issue=/run/issue.d/45-kamerplanter-restore.issue
+# The records of the pre-update backups, one per version left (backups/D).
+backups=$state/backups
+# The record of the backup disk, and the key of an encrypted data disk as the
+# disk service keeps it on the system disk (spec/distribution-requirements/
+# E8, E14).
+backup_disk_record=/var/lib/kamerplanter/disks/backup.env
+data_disk_key=/var/lib/kamerplanter/disks/keys/data.key
 
 die() { echo "kamerplanter-update: $*" >&2; exit 1; }
+
+# update_lock: takes the lock of the update actions ($state/.lock on fd 9)
+# without waiting, once per run: a subshell, and a command run from here,
+# keep it, so that what follows a fetch (cleanup) runs under the same lock.
+# Fails when another action holds it.
+update_locked=0
+update_lock() {
+    [ "$update_locked" = 0 ] || return 0
+    install -d -m 0700 "$state" || return 1
+    exec 9>"$state/.lock" || return 1
+    flock -n 9 || return 1
+    update_locked=1
+}
 
 # shellcheck source=image/rootfs/usr/lib/kamerplanter/env.sh
 . /usr/lib/kamerplanter/env.sh
@@ -55,13 +120,20 @@ count() {
     if [[ $value =~ ^[1-9][0-9]*$ ]]; then printf '%s' "$value"; else printf '%s' "$2"; fi
 }
 
-log() {  # log EVENT RESULT DETAIL [FROM] [TO]
+# keep_period: UPDATE_BACKUP_KEEP_DAYS, at least the minimum of keep_days in
+# /usr/lib/kamerplanter/env.sh: with a data disk the user file is on it.
+keep_period() { keep_days "$(count UPDATE_BACKUP_KEEP_DAYS 7)"; }
+
+log() {  # log EVENT RESULT DETAIL [FROM] [TO] [JSON]; JSON, an object, is added
     install -d -m 0700 "$state"
+    local extra=${6-}
+    [ -n "$extra" ] || extra='{}'
     jq -cn --arg time "$(date -u +%FT%TZ)" --arg event "$1" --arg result "$2" \
-        --arg detail "$3" --arg from "${4-}" --arg to "${5-}" \
+        --arg detail "$3" --arg from "${4-}" --arg to "${5-}" --argjson extra "$extra" \
         '{time: $time, event: $event, result: $result, detail: $detail}
          + (if $from != "" then {from: $from} else {} end)
-         + (if $to != "" then {to: $to} else {} end)' >>"$state/log.jsonl"
+         + (if $to != "" then {to: $to} else {} end)
+         + $extra' >>"$state/log.jsonl"
     echo "$1: $2: $3" >&2
 }
 
@@ -79,23 +151,9 @@ slot() { host | jq -r --arg s "$1" --arg f "$2" '.status[$s].image // {} | (
     else empty end) // ""'; }
 short() { printf '%s' "${1#sha256:}" | cut -c1-12; }
 
-# Releases are versioned X.Y or X.Y.Z, optionally with a leading v (the
-# release tag); anything else is a development build.
-release_version() {
-    local v=${1#v}
-    [[ $v =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 1
-    printf '%s' "$v"
-}
-# forward CANDIDATE RUNNING: whether version CANDIDATE may follow RUNNING
-# (spec A4): a release only after an older release. A development build runs
-# anything after it, and is never accepted after a release.
-forward() {
-    local candidate running
-    running=$(release_version "$2") || return 0
-    candidate=$(release_version "$1") || return 1
-    [ "$candidate" != "$running" ] &&
-        [ "$(printf '%s\n%s\n' "$running" "$candidate" | sort -V | tail -n1)" = "$candidate" ]
-}
+# release_version and forward, the comparison of releases (spec A4), come from
+# /usr/lib/kamerplanter/env.sh, which checks the release marker of the data
+# disk with the same comparison (A7).
 
 failed() { [ -n "$1" ] && grep -Fqx -- "$1" "$state/failed" 2>/dev/null; }
 pending() { cat "$state/pending" 2>/dev/null || true; }
@@ -109,26 +167,470 @@ volume_bytes() {
     echo "$total"
 }
 
-# A backup needs room for a copy of the volumes plus a margin of 10 % and
-# 512 MiB for the database to keep working (spec D5).
-space_ok() {
-    local need free
-    need=$(($(volume_bytes) * 11 / 10 + 512 * 1024 * 1024))
-    free=$(($(stat -f -c '%a * %S' /var)))
-    [ "$free" -ge "$need" ] || { echo "$free bytes free in /var, $need needed for the pre-update backup"; return 1; }
+# ---------------------------------------------------------------------------
+# The pre-update backup and where it is (spec/update-and-rollback/ D2, D4,
+# D5, D8, D10). The locations, their order, the protection rule and the space
+# rule are in /usr/lib/kamerplanter/env.sh (backup_locations, backup_refusal,
+# space_problem, restore_problem); tests/unit/backup.sh checks them. Here the
+# update tool finds what each location is like now, and acts on it.
+
+# location_uuid LOCATION: the identity recorded for the disk of LOCATION, in
+# lower case; empty for the system disk or a disk not set up.
+location_uuid() {
+    local uuid=
+    case $1 in
+        backup-disk) uuid=$(record_field UUID "$backup_disk_record") ;;
+        data-disk) uuid=$(record_field UUID "$data_disk_record") ;;
+    esac
+    printf '%s' "${uuid,,}"
+}
+
+# location_state LOCATION: ok, not-set-up, missing, foreign or moving, as
+# backup_refusal takes it. A disk counts only mounted under the identity
+# recorded for it (spec/distribution-requirements/ E8), and answering.
+location_state() {
+    case $1 in
+        system-disk) echo ok ;;
+        backup-disk)
+            if [ ! -e "$backup_disk_record" ]; then
+                echo not-set-up
+            elif ! mount_present "$backup_disk_mount"; then
+                echo missing
+            elif [ "$(mounted_uuid "$backup_disk_mount")" != "$(location_uuid backup-disk)" ]; then
+                echo foreign
+            else
+                echo ok
+            fi
+            ;;
+        data-disk)
+            if [ ! -e "$data_disk_record" ]; then
+                echo not-set-up
+            elif ! data_disk_placed || ! data_disk_present; then
+                echo missing
+            elif [ "$(mounted_uuid "$data_disk_mount")" != "$(location_uuid data-disk)" ]; then
+                echo foreign
+            else
+                case $(data_disk_move_field STATE) in
+                    copying | moved | falling-back) echo moving ;;
+                    *) echo ok ;;
+                esac
+            fi
+            ;;
+        *) echo unknown ;;
+    esac
+}
+
+# record_encrypted RECORD: whether the disk of RECORD was set up encrypted.
+record_encrypted() { [ "$(record_field ENCRYPTION "$1")" = luks2 ]; }
+
+# data_encrypted: 1 when the data disk is set up encrypted, else 0.
+data_encrypted() {
+    if [ -e "$data_disk_record" ] && record_encrypted "$data_disk_record"; then echo 1; else echo 0; fi
+}
+
+# protected LOCATION: 1 when LOCATION is protected as an encrypted data disk
+# requires (D8, spec/distribution-requirements/ E16), else 0. The data disk
+# protects itself. The system disk counts when the key of the data disk is
+# kept on it (E14): the key is never sealed in the TPM, so whoever holds the
+# system disk can open the data disk anyway, and a backup there adds nothing
+# they could not read; without the key there, an unencrypted copy would.
+protected() {
+    case $1 in
+        backup-disk) if record_encrypted "$backup_disk_record"; then echo 1; else echo 0; fi ;;
+        data-disk) data_encrypted ;;
+        system-disk) if [ -f "$data_disk_key" ] && [ ! -L "$data_disk_key" ]; then echo 1; else echo 0; fi ;;
+        *) echo 0 ;;
+    esac
+}
+
+free_bytes() { echo $(($(stat -f -c '%a * %S' "$1"))); }
+
+# deployment_root SLOT: the tree of the deployment in bootc's SLOT
+# (/sysroot/ostree/deploy/STATEROOT/deploy/CHECKSUM.SERIAL, from bootc's
+# status); empty when bootc does not name one in that form.
+deployment_root() {
+    local stateroot checksum serial
+    read -r stateroot checksum serial < <(host | jq -r --arg s "$1" \
+        '.status[$s].ostree // {} | "\(.stateroot // "") \(.checksum // "") \(.deploySerial // "")"') || return 0
+    [[ $stateroot =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ && $checksum =~ ^[0-9a-f]{64}$ && $serial =~ ^[0-9]+$ ]] || return 0
+    printf '%s' "$deployments/$stateroot/deploy/$checksum.$serial"
+}
+
+# rollback_support FROM [FEATURE]: whether the release a rollback returns to
+# lists FEATURE (by default backup-locations: it finds a backup at every
+# location) in its features: supported, unsupported, or unknown when bootc's
+# rollback deployment is not FROM, the release that was left, or its tree is
+# not there (rollback_reach in /usr/lib/kamerplanter/env.sh).
+rollback_support() {
+    local root
+    if [ -z "$1" ] || [ "$(slot rollback digest)" != "$1" ]; then echo unknown; return; fi
+    root=$(deployment_root rollback)
+    if [ -z "$root" ] || [ ! -d "$root/usr" ]; then echo unknown; return; fi
+    if has_feature "$root" "${2:-backup-locations}"; then echo supported; else echo unsupported; fi
+}
+
+# assess [FROM]: what each location of backup_locations is like for a backup
+# of the volumes now, in that order: sets at_state and at_reason (empty when
+# the location may take the backup and has space for it). With FROM, the
+# release the guard would roll back to, a disk counts only when that release
+# finds backups there (rollback_support); without, as for an activation,
+# whose rollback target is the running release.
+assess() {
+    local loc need encrypted reason fs reach=''
+    need=$(backup_need "$(volume_bytes)")
+    encrypted=$(data_encrypted)
+    if [ $# -gt 0 ]; then reach=$(rollback_reach "$(rollback_support "$1")" "$(slot rollback version)"); fi
+    at_state=() at_reason=()
+    for loc in "${backup_locations[@]}"; do
+        at_state+=("$(location_state "$loc")")
+        reason=$(backup_refusal "$loc" "${at_state[-1]}" "$encrypted" "$(protected "$loc")")
+        if [ "$loc" != system-disk ] && [ "${at_state[-1]}" != not-set-up ] && [ -n "$reach" ]; then reason=$reach; fi
+        if [ -z "$reason" ]; then
+            fs=$(backup_fs "$loc")
+            reason=$(space_problem "$(free_bytes "$fs")" "$need" "$fs")
+        fi
+        at_reason+=("$reason")
+    done
+}
+
+# refusals: after assess (and the attempts that changed at_reason), sets
+# refused_at to the locations that are set up and do not take the backup, as
+# LOCATION REASON pairs for backup_summary, and skipped_json to every
+# location skipped, with its reason, for the update record.
+refusals() {
+    local i
+    refused_at=() skipped_json='[]'
+    for i in "${!backup_locations[@]}"; do
+        [ -n "${at_reason[i]}" ] || continue
+        skipped_json=$(jq -c --arg l "${backup_locations[i]}" --arg r "${at_reason[i]}" \
+            '. + [{location: $l, reason: $r}]' <<<"$skipped_json")
+        [ "${at_state[i]}" = not-set-up ] || refused_at+=("${backup_locations[i]}" "${at_reason[i]}")
+    done
+}
+
+# backup_possible: whether some location takes a backup of the volumes now
+# (D5); prints why not when none does.
+backup_possible() {
+    assess
+    backup_first "${at_reason[@]}" >/dev/null && return 0
+    refusals
+    backup_summary "${refused_at[@]}"
+    return 1
+}
+
+# backup_checksum DIR: the SHA-256 of a backup (D10): of the type, mode,
+# owner, path and link target of everything in DIR, and of the content of
+# every file. Fails when anything cannot be read.
+backup_checksum() {
+    local sum
+    sum=$(
+        {
+            (cd -- "$1" && find . -mindepth 1 -printf '%y %m %U:%G %p -> %l\n' | LC_ALL=C sort) &&
+                (cd -- "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0r sha256sum --)
+        } | sha256sum
+    ) || return 1
+    printf '%s' "${sum%% *}"
+}
+
+# write_record FILE KEY=VALUE...: sets the KEYs in the record FILE, the other
+# lines kept, durably: a reader sees the old or the new record.
+write_record() {
+    local file=$1 tmp pair keys=()
+    shift
+    for pair in "$@"; do keys+=("${pair%%=*}"); done
+    install -d -m 0700 "$(dirname "$file")" || return 1
+    tmp=$(mktemp "$file.XXXXXX") || return 1
+    if {
+        if [ -f "$file" ]; then grep -v -E "^($(IFS='|'; echo "${keys[*]}"))=" -- "$file" || true; fi
+        for pair in "$@"; do printf '%s\n' "${pair//$'\n'/ }"; done
+    } >"$tmp" && sync "$tmp" && mv -fT -- "$tmp" "$file" && sync -f "$(dirname "$file")"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+# backup_dir D: the directory of the recorded backup of D; empty without a
+# record naming a known location.
+backup_dir() {
+    local base
+    base=$(backup_base "$(record_field LOCATION "$backups/$1")") || return 0
+    printf '%s/%s' "$base" "$1"
+}
+
+# readable D: why the recorded backup of D cannot be read now; empty when it
+# can (restore_problem, for the location and the disk the record names).
+readable() {
+    local rec=$backups/$1 loc
+    loc=$(record_field LOCATION "$rec")
+    backup_base "$loc" >/dev/null || { echo "its record names no known location (${loc:-none})"; return; }
+    restore_problem "$loc" "$(location_state "$loc")" "$(record_field UUID "$rec")" "$(location_uuid "$loc")"
+}
+
+# backup_problem D: why the recorded backup of D is not restored: it cannot
+# be read, it is no directory of its own (backup_entry_problem in
+# /usr/lib/kamerplanter/env.sh), its directory is gone, or it does not match
+# its checksum (D10); empty when it may be restored.
+backup_problem() {
+    local problem dir sum where loc
+    problem=$(readable "$1")
+    if [ -n "$problem" ]; then echo "$problem"; return; fi
+    loc=$(record_field LOCATION "$backups/$1")
+    dir=$(backup_dir "$1")
+    where=$(backup_where "$loc")
+    problem=$(backup_entry_problem "$loc" "$1")
+    if [ -n "$problem" ]; then echo "it is not read on $where: $problem"; return; fi
+    [ -d "$dir" ] || { echo "it is recorded on $where, but $dir is not there"; return; }
+    if ! sum=$(backup_checksum "$dir"); then
+        echo "it cannot be read completely on $where ($dir)"
+        return
+    fi
+    [ "$sum" = "$(record_field SHA256 "$backups/$1")" ] ||
+        echo "it does not match the checksum recorded when it was taken; it was changed or damaged on $where ($dir)"
+}
+
+# forget_backup D: before a new backup of D, the earlier one is deleted with
+# its record. When its disk is missing, only the record goes; cleanup deletes
+# the backup left there once that disk is back and the keeping period is over.
+# A backup that is no directory of its own (a symbolic link) is not followed
+# and stays; only the record goes, and the new backup goes elsewhere.
+forget_backup() {
+    local loc
+    [ -e "$backups/$1" ] || return 0
+    loc=$(record_field LOCATION "$backups/$1")
+    if backup_base "$loc" >/dev/null && [ -z "$(readable "$1")" ]; then
+        backup_delete "$loc" "$1" || echo "the earlier backup of $(short "$1") on $(backup_where "$loc") is left as it is" >&2
+    fi
+    rm -f -- "${backups:?}/${1:?}"
+}
+
+# write_backup LOCATION D TO: the volumes and the marker copy into the backup
+# of D at LOCATION, its checksum, then its record; fails, and leaves nothing
+# of it behind, when any of that cannot be written. Writes only into a
+# directory of its own (backup_create in /usr/lib/kamerplanter/env.sh).
+write_backup() {
+    local base dir sum
+    base=$(backup_base "$1") || return 1
+    dir=$base/${2:?}
+    if backup_create "$1" "$2" &&
+        copy_volumes "$volumes" "$dir" && backup_marker "$dir" && sum=$(backup_checksum "$dir") &&
+        sync -f "$dir" &&
+        write_record "$backups/$2" LOCATION="$1" UUID="$(location_uuid "$1")" SHA256="$sum" \
+            TAKEN="$(date -u +%FT%TZ)" TO="$3"; then
+        return 0
+    fi
+    backup_delete "$1" "$2" || true
+    rm -f -- "${backups:?}/${2:?}"
+    return 1
+}
+
+# take_backup D TO: the pre-update backup of the volumes, left by D for TO,
+# at the first location that takes it (D8): a location that is refused, has
+# no space, or cannot be written to is skipped for the next one. Records the
+# location used and why the others were skipped. When none takes it, sets
+# backup_failure to why, and fails.
+take_backup() {
+    local i where='' detail=''
+    backup_failure=
+    forget_backup "$1" || { backup_failure="the earlier backup of $(short "$1") could not be deleted"; return 1; }
+    assess "$1"
+    for i in "${!backup_locations[@]}"; do
+        [ -z "${at_reason[i]}" ] || continue
+        if write_backup "${backup_locations[i]}" "$1" "$2"; then
+            where=${backup_locations[i]}
+            break
+        fi
+        at_reason[i]="the data could not be copied for the pre-update backup"
+    done
+    refusals
+    if [ -z "$where" ]; then
+        backup_failure=$(backup_summary "${refused_at[@]}")
+        return 1
+    fi
+    for ((i = 0; i < ${#refused_at[@]}; i += 2)); do
+        detail+="; not on $(backup_where "${refused_at[i]}"): ${refused_at[i + 1]}"
+    done
+    log update backup "data backed up before the first start of $(slot booted version) on $(backup_where "$where")$detail" \
+        "$1" "$2" "$(jq -cn --arg l "$where" --argjson s "$skipped_json" '{location: $l, skipped: $s}')"
+}
+
+# restore_refused D TO PROBLEM: the backup of D is not restored. The services
+# stay stopped (the guard fails), and the journal, the update record and the
+# console say why. The pending record stays, so the guard tries again when
+# it runs next.
+restore_refused() {
+    local message hint
+    message="the data backup from before the update to $(short "$2") cannot be restored: $3; the services stay stopped, so that $(slot booted version) does not run on data the newer release may have changed"
+    case $3 in
+        *"does not match the checksum"* | *"cannot be read completely"* | *"is not there"* | *"no known location"*)
+            hint="the backup is damaged or gone; restore the data by hand from another backup (see: kamerplanter-update status)"
+            ;;
+        *)
+            hint="make the disk available again under the identity it was set up with, then reboot (or run: systemctl restart kamerplanter-backup-disk.service kamerplanter.target)"
+            ;;
+    esac
+    log rollback refused "$message" "$2" "$1"
+    echo "$hint" >&2
+    install -d -m 0755 /run/issue.d
+    {
+        echo "Kamerplanter: $message"
+        echo "  $hint"
+        echo "  details: systemctl status kamerplanter-update-guard.service"
+        echo
+    } >"$restore_issue.tmp"
+    chmod 0644 "$restore_issue.tmp"
+    mv "$restore_issue.tmp" "$restore_issue"
+    agetty --reload >/dev/null 2>&1 || true
+}
+clear_restore_issue() {
+    if [ -e "$restore_issue" ]; then
+        rm -f "$restore_issue"
+        agetty --reload >/dev/null 2>&1 || true
+    fi
 }
 
 # copy_volumes SRC_DIR DST_DIR; fails on the first volume that does not copy
 # completely. Checked explicitly, because callers test it in a condition,
-# where set -e does not apply.
+# where set -e does not apply. A destination bound from the data disk is a
+# mount point: it stays, and only what it holds is replaced, on the disk.
 copy_volumes() {
     local name
     for name in "${data_volumes[@]}"; do
         [ -d "$1/$name" ] || continue
-        rm -rf "${2:?}/$name" || return 1
-        cp -a --reflink=auto "$1/$name" "$2/$name" || return 1
+        if mountpoint -q "$2/$name"; then
+            find "$2/$name" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || return 1
+            cp -a --reflink=auto "$1/$name/." "$2/$name/" || return 1
+            sync -f "$2/$name" || return 1
+        else
+            rm -rf "${2:?}/$name" || return 1
+            cp -a --reflink=auto "$1/$name" "$2/$name" || return 1
+        fi
     done
     sync -f "$2" || return 1
+}
+
+# ---------------------------------------------------------------------------
+# The release marker of the data disk (spec/distribution-requirements/ E13,
+# spec/update-and-rollback/ A7). The decisions are in
+# /usr/lib/kamerplanter/env.sh (data_disk_release, marker_refuses,
+# marker_raises, downgrade_allowed); tests/unit/disks.sh checks them. Without
+# a data disk none of this does anything.
+
+# running_release: the running version as compared and shown: a release
+# without its leading v, or the label of a development build, at most 64
+# characters with anything outside [A-Za-z0-9._+~-] replaced, so it is one
+# word in the overrides file and harmless in a message; "unversioned" when
+# the image has no version.
+running_release() {
+    local v
+    v=$(slot booted version)
+    release_version "$v" && return 0
+    v=${v:-unversioned}
+    v=${v:0:64}
+    printf '%s' "${v//[^A-Za-z0-9._+~-]/?}"
+}
+
+# write_marker CONTENT: replaces the marker on the data disk with CONTENT,
+# durably and never through a link: a reader sees the old or the new marker.
+write_marker() {
+    local tmp
+    tmp=$(mktemp "$data_disk_mount/.release.XXXXXX") || return 1
+    if ! { printf '%s\n' "$1" >"$tmp" && sync "$tmp" && mv -fT -- "$tmp" "$data_disk_marker"; }; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    sync -f "$data_disk_mount"
+}
+
+# backup_marker DIR: the marker into the pre-update backup in DIR (spec
+# update-and-rollback/ D2), so that the rollback restores it with the data.
+# No copy when the disk has no marker or no data disk is set up, also none
+# left from an earlier backup in the same DIR.
+backup_marker() {
+    local disk
+    disk=$(data_disk_release)
+    rm -f -- "$1/data-disk-release" || return 1
+    [ -z "$disk" ] || printf '%s\n' "$disk" >"$1/data-disk-release"
+}
+
+# restore_marker DIR: the marker as it was when the backup in DIR was taken.
+# A backup without one restores a disk without one: it was either unmarked
+# then, or the data was on the system disk.
+restore_marker() {
+    [ -e "$data_disk_record" ] || return 0
+    if [ -f "$1/data-disk-release" ]; then
+        write_marker "$(head -n1 -- "$1/data-disk-release")"
+    elif [ -e "$data_disk_marker" ] || [ -L "$data_disk_marker" ]; then
+        rm -f -- "$data_disk_marker" && sync -f "$data_disk_mount"
+    fi
+}
+
+# release_check: before any container starts, after a rollback has restored
+# the marker. Keeps the services stopped (fails, and so does the guard, which
+# every container requires) while the data disk is marked by a newer release
+# than the running one, unless allow-downgrade was run for exactly this pair;
+# the journal, the update record and the console name both releases.
+release_check() {
+    local disk running hint
+    disk=$(data_disk_release)
+    running=$(running_release)
+    if ! marker_refuses "$disk" "$running"; then
+        clear_release_issue
+        return 0
+    fi
+    if downgrade_allowed "$disk" "$running" "$state/downgrades"; then
+        echo "release $running uses the data disk kp-data, which release $disk used, as allowed by kamerplanter-update allow-downgrade"
+        clear_release_issue
+        return 0
+    fi
+    local message
+    if [ "$disk" = unreadable ]; then
+        message="the release marker of the data disk kp-data is unreadable, so release $running cannot tell whether a newer release has used the disk"
+    elif ! release_version "$running" >/dev/null; then
+        message="the data disk kp-data was used by release $disk; the running $running is a development build, which counts as older than any release"
+    else
+        message="the data disk kp-data was used by release $disk, which is newer than the running release $running"
+    fi
+    if [ "$disk" = unreadable ]; then
+        hint="run a release that used the disk, or restore its data from a backup; to run $running on it all the same, run as root: kamerplanter-update allow-downgrade $disk $running"
+    else
+        hint="return to release $disk or newer; to run $running on it all the same, at the risk of data that $disk has migrated, run as root: kamerplanter-update allow-downgrade $disk $running"
+    fi
+    log release refused "$message; the services stay stopped"
+    echo "$hint" >&2
+    install -d -m 0755 /run/issue.d
+    {
+        echo "Kamerplanter: $message; the services stay stopped"
+        echo "  $hint"
+        echo "  details: systemctl status kamerplanter-update-guard.service"
+        echo
+    } >"$release_issue.tmp"
+    chmod 0644 "$release_issue.tmp"
+    mv "$release_issue.tmp" "$release_issue"
+    agetty --reload >/dev/null 2>&1 || true
+    return 1
+}
+clear_release_issue() {
+    if [ -e "$release_issue" ]; then
+        rm -f "$release_issue"
+        agetty --reload >/dev/null 2>&1 || true
+    fi
+}
+
+# raise_marker: after the services passed the health check, the running
+# release into the marker when it is higher than what the marker holds
+# (marker_raises). A failure is recorded; the services keep running.
+raise_marker() {
+    [ -e "$data_disk_record" ] && data_disk_placed || return 0
+    local disk running
+    disk=$(data_disk_release)
+    running=$(running_release)
+    marker_raises "$running" "$disk" || return 0
+    if write_marker "$running"; then
+        log release marked "the data disk kp-data is marked as used by release $running${disk:+ (was $disk)}"
+    else
+        log release error "the release marker of the data disk kp-data could not be raised to $running; it stays ${disk:-unset}"
+    fi
 }
 
 write_issue() {
@@ -166,8 +668,50 @@ cmd_status() {
     local json=0
     [ "${1-}" = --json ] && json=1
     local doc
+    # The data disk, when one is set up: the release its marker holds, whether
+    # the running release is refused on it, and the overrides recorded.
+    local disk=null release running refused=false mounted=false
+    if [ -e "$data_disk_record" ]; then
+        if data_disk_placed; then mounted=true; fi
+        release=$(data_disk_release)
+        running=$(running_release)
+        if marker_refuses "$release" "$running" && ! downgrade_allowed "$release" "$running" "$state/downgrades"; then
+            refused=true
+        fi
+        disk=$(jq -cn --arg release "$release" --argjson refused "$refused" --argjson mounted "$mounted" \
+            --rawfile allowed <(cat "$state/downgrades" 2>/dev/null || true) '{
+              inPlace: $mounted,
+              release: (if $release == "" then null else $release end),
+              refused: $refused,
+              allowedDowngrades: ($allowed | split("\n") | map(select(. != "") | split(" ")
+                  | {disk: .[0], running: .[1], time: .[2]}))
+            }')
+    fi
+    # The move of the system disk's data onto the data disk (E11), when one
+    # is recorded.
+    local move=null
+    if [ -f "$data_disk_move" ]; then
+        local verified due=''
+        verified=$(data_disk_move_field VERIFIED)
+        if [ -n "$verified" ] && verified=$(date -d "$verified" +%s 2>/dev/null); then
+            due=$(date -u -d "@$((verified + $(keep_period) * 86400))" +%FT%TZ)
+        fi
+        move=$(jq -n --arg state "$(data_disk_move_field STATE)" --arg disk "$(data_disk_move_field NAMED)" \
+            --arg started "$(data_disk_move_field STARTED)" --arg moved "$(data_disk_move_field MOVED)" \
+            --arg verified "$(data_disk_move_field VERIFIED)" --arg cleaned "$(data_disk_move_field CLEANED)" \
+            --arg failed "$(data_disk_move_field FAILED)" --arg reason "$(data_disk_move_field REASON)" \
+            --arg ignored "$(data_disk_move_field IGNORED_NAME)" --arg due "$due" '
+            def n: if . == "" then null else . end;
+            {state: ($state | n), disk: ($disk | n), started: ($started | n), moved: ($moved | n),
+             healthy: ($verified | n), systemCopyDeletedAfter: (if $state == "verified" then ($due | n) else null end),
+             systemCopyDeleted: ($cleaned | n), failed: ($failed | n), reason: ($reason | n),
+             namingIgnored: ($ignored | n)}')
+    fi
+    local backups_json
+    backups_json=$(backup_list)
     doc=$(host | jq --arg window "$(next_window)" --arg postponed "$(postponed_until || true)" \
         --arg pending "$(pending)" --rawfile failed <(cat "$state/failed" 2>/dev/null || true) \
+        --argjson disk "$disk" --argjson move "$move" --argjson backups "$backups_json" \
         --slurpfile log <(tail -n 20 "$state/log.jsonl" 2>/dev/null || true) '
         def slot(s): .status[s].image // null | if . == null then null else
             {version, digest: .imageDigest, image: .image.image, timestamp} end;
@@ -178,6 +722,9 @@ cmd_status() {
           postponedUntil: (if $postponed == "" then null else ($postponed | tonumber | todate) end),
           checking: (if $pending == "" then null else ($pending | split(" ") | {from: .[0], to: .[1]}) end),
           failed: ($failed | split("\n") | map(select(. != ""))),
+          dataDisk: $disk,
+          dataDiskMove: $move,
+          backups: $backups,
           record: $log
         }')
     if [ "$json" = 1 ]; then
@@ -194,15 +741,73 @@ cmd_status() {
         (if .postponedUntil then "Postponed until \(.postponedUntil)" else empty end),
         (if .checking then "Checking:       update \(.checking.from[7:19]) -> \(.checking.to[7:19])" else empty end),
         (if (.failed | length) > 0 then "Never applied:  \(.failed | map(.[7:19]) | join(", "))" else empty end),
+        (if .dataDisk then
+            "Data disk:      kp-data, " + (if .dataDisk.inPlace | not then "not in place (see: kamerplanter-data-disk.service)"
+                elif .dataDisk.release == null then "no release marker yet"
+                elif .dataDisk.release == "unreadable" then "release marker unreadable"
+                else "marked by release \(.dataDisk.release)" end)
+            + (if .dataDisk.refused then "; newer than the running release, the services stay stopped" else "" end),
+            (.dataDisk.allowedDowngrades[] | "  allowed:      \(.running) on the disk of \(.disk) (\(.time))")
+         else empty end),
+        (.dataDiskMove // empty | "Data disk move: " + (
+            if .state == "copying" then "copying onto \(.disk) since \(.started); the system disk is in use until it is complete"
+            elif .state == "moved" then "moved on \(.moved); the health check from the data disk is pending, the copy on the system disk is kept"
+            elif .state == "verified" then "moved on \(.moved), healthy since \(.healthy); the copy on the system disk is deleted after \(.systemCopyDeletedAfter // "the keeping period")"
+            elif .state == "cleaned" then "moved on \(.moved), healthy since \(.healthy); the copy on the system disk was deleted on \(.systemCopyDeleted)"
+            elif .state == "falling-back" then "unhealthy from the data disk (\(.reason)); returning to the copy on the system disk"
+            elif .state == "failed" then "onto \(.disk) failed on \(.failed): \(.reason); the data is on the system disk"
+                + (if .namingIgnored then "; \(.namingIgnored) is not used until it is named anew" else "" end)
+            else .state end)),
+        (.backups[] | "Backup:         of \(.of[7:19]) on " + (
+            if .location == "backup-disk" then "the backup disk kp-backup"
+            elif .location == "data-disk" then "the data disk kp-data"
+            else "the system disk" end)
+            + (if .taken then ", taken \(.taken)" else "" end)
+            + (if .checksum then "" else ", without a checksum" end)
+            + (if .deletionPending then "; due for deletion since \(.deletionPending), which waits: \(.problem // "the disk is not available")"
+               elif .problem then "; cannot be read now: \(.problem)"
+               elif .deleteAfter then "; deleted after \(.deleteAfter)"
+               else "" end)),
         "",
         "Recent events:",
         (.record[] | "  \(.time)  \(.event)  \(.result)  \(.detail)")' <<<"$doc"
 }
 
+# backup_list: the pre-update backups as JSON for cmd_status: those the
+# records name, wherever they are, whether they can be read now, when they
+# are deleted, and whether a deletion waits for their disk (D10); and the
+# backups on the system disk no record names, taken by a release that kept
+# none.
+backup_list() {
+    local list='[]' rec d keep taken epoch after problem pending_since dir
+    keep=$(keep_period)
+    for rec in "$backups"/*; do
+        [ -f "$rec" ] || continue
+        d=${rec##*/}
+        taken=$(record_field TAKEN "$rec")
+        after=''
+        if epoch=$(date -d "$taken" +%s 2>/dev/null); then after=$(date -u -d "@$((epoch + keep * 86400))" +%FT%TZ); fi
+        problem=$(readable "$d")
+        pending_since=$(record_field DELETE_PENDING "$rec")
+        list=$(jq -c --arg of "$d" --arg location "$(record_field LOCATION "$rec")" --arg disk "$(record_field UUID "$rec")" \
+            --arg taken "$taken" --arg after "$after" --arg problem "$problem" --arg pending "$pending_since" '
+            def n: if . == "" then null else . end;
+            . + [{of: $of, location: $location, disk: ($disk | n), taken: ($taken | n), checksum: true,
+                  deleteAfter: ($after | n), problem: ($problem | n), deletionPending: ($pending | n)}]' <<<"$list")
+    done
+    for dir in "$state"/backup/*/; do
+        [ -d "$dir" ] || continue
+        d=$(basename "$dir")
+        [ "$(record_field LOCATION "$backups/$d")" != system-disk ] || continue
+        list=$(jq -c --arg of "$d" --arg taken "$(date -u -r "$dir" +%FT%TZ)" '
+            . + [{of: $of, location: "system-disk", disk: null, taken: $taken, checksum: false,
+                  deleteAfter: null, problem: null, deletionPending: null}]' <<<"$list")
+    done
+    printf '%s' "$list"
+}
+
 cmd_fetch() {
-    install -d -m 0700 "$state"
-    exec 9>"$state/.lock"
-    flock -n 9 || die "another update action is running"
+    update_lock || die "another update action is running"
     write_issue || true
     [ -z "$(pending)" ] || { echo "an update is being checked; not fetching"; return 0; }
     local ref transport remote booted staged
@@ -252,9 +857,7 @@ cmd_fetch() {
 cmd_apply() {
     local now=0
     [ "${1-}" = --now ] && now=1
-    install -d -m 0700 "$state"
-    exec 9>"$state/.lock"
-    flock -n 9 || die "another update action is running"
+    update_lock || die "another update action is running"
     local booted staged reason
     booted=$(slot booted digest)
     staged=$(slot staged digest)
@@ -272,7 +875,9 @@ cmd_apply() {
         log apply refused "the staged $(slot staged version) is not newer than the running $(slot booted version)" "$booted" "$staged"
         return 1
     fi
-    if ! reason=$(space_ok); then
+    # D5: some location of D8 must take the backup; the guard chooses it
+    # again on the activating boot, when the disks may have changed.
+    if ! reason=$(backup_possible); then
         log apply refused "$reason" "$booted" "$staged"
         return 1
     fi
@@ -302,15 +907,26 @@ cmd_resume() {
 }
 
 cmd_rollback() {
-    exec 9>"$state/.lock"
-    flock -n 9 || die "another update action is running"
+    update_lock || die "another update action is running"
     local booted previous
     booted=$(slot booted digest)
     previous=$(slot rollback digest)
     [ -n "$previous" ] || die "there is no previous version to return to"
     failed "$previous" && die "the previous version $(short "$previous") failed its own update and cannot be returned to"
-    [ -d "$state/backup/$previous" ] ||
+    # A release without data disks would ignore the disk set up, and run on
+    # what the system disk holds underneath: an old copy, or nothing, for which
+    # configure would generate new secrets.
+    if [ -e "$data_disk_record" ] && [ "$(rollback_support "$previous" data-disk)" != supported ]; then
+        die "a data disk is set up, and the previous version $(slot rollback version) ($(short "$previous")) does not know data disks, or cannot be checked for them; it would run without the data on that disk, so it is not returned to"
+    fi
+    local problem
+    if [ -e "$backups/$previous" ]; then
+        problem=$(backup_problem "$previous")
+        [ -z "$problem" ] ||
+            die "the data backup from before the update cannot be restored for $(short "$previous"): $problem; returning would run it on data it may not read"
+    elif [ ! -d "$state/backup/$previous" ]; then
         die "no data backup from before the update exists for $(short "$previous"); returning would run it on data it may not read"
+    fi
     [ -z "$(pending)" ] || die "an update is being checked; wait for its result"
     cat >&2 <<EOF
 Returning to $(slot rollback version) ($(short "$previous")).
@@ -332,9 +948,62 @@ EOF
     fi
 }
 
+# allow-downgrade DISK RUNNING: the deliberate override of E13. Only root, on
+# the console or through administrative access; nothing in the web UI, the
+# API, the provisioning data or on the data disk reaches it. It holds only for
+# the pair it names, which must be the pair in effect: the release the marker
+# of the data disk holds (or "unreadable") and the running release, as the
+# refusal names them. It is recorded in the update state on the system disk
+# (downgrades, log.jsonl); the marker stays as it is, so a later release
+# older than DISK, or another running release, needs an override of its own.
+# Then it restarts kamerplanter.target, which runs the failed guard again and
+# starts the services; a reboot does the same.
+cmd_allow_downgrade() {
+    [ $# -eq 2 ] || die "usage: kamerplanter-update allow-downgrade <disk release> <running release>"
+    [ -e "$data_disk_record" ] || die "no data disk is set up; there is nothing to allow"
+    data_disk_placed || die "the data disk kp-data is missing or not in place (see: systemctl status kamerplanter-data-disk.service)"
+    update_lock || die "another update action is running"
+    local disk running named_disk named_running
+    disk=$(data_disk_release)
+    running=$(running_release)
+    marker_refuses "$disk" "$running" ||
+        die "release $running may use the data disk kp-data (${disk:+marked by release $disk}${disk:-not marked}); there is nothing to allow"
+    named_disk=$(release_version "$1") || named_disk=$1
+    named_running=$(release_version "$2") || named_running=$2
+    [ "$named_disk" = "$disk" ] && [ "$named_running" = "$running" ] ||
+        die "the pair named ($1, $2) is not the one in effect: the data disk kp-data was used by $disk, the running release is $running"
+    if downgrade_allowed "$disk" "$running" "$state/downgrades"; then
+        echo "release $running is allowed on the data disk of release $disk already"
+    else
+        cat >&2 <<EOF
+Release $running is to start the services on the data disk kp-data, which
+release $disk has used. $disk may have migrated the data in a way that $running
+cannot read, or damages when it writes. If in doubt, restore a backup from
+before $disk instead.
+This override holds only for $running on a disk of $disk.
+EOF
+        if [ -t 0 ]; then
+            read -r -p "Continue? [y/N] " answer
+            [ "$answer" = y ] || [ "$answer" = Y ] || die "cancelled"
+        fi
+        printf '%s %s %s\n' "$disk" "$running" "$(date -u +%FT%TZ)" >>"$state/downgrades"
+        sync "$state/downgrades"
+        log allow-downgrade ok "release $running may use the data disk kp-data, which release $disk used; overridden deliberately as root"
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl restart --no-block kamerplanter.target ||
+            die "the services could not be started; run: systemctl restart kamerplanter.target"
+        echo "the services are starting (see: systemctl status kamerplanter.target)"
+    fi
+}
+
 # Before the databases start, on every boot.
 cmd_guard() {
-    install -d -m 0700 "$state" "$state/backup"
+    # The unit requires kamerplanter-data-disk.service; this holds however the
+    # guard is started: no backup or restore on the system disk underneath a
+    # volume of a data disk that is not in place.
+    data_disk_placed || die "the data disk kp-data is missing or not in place; no backup or restore (see: systemctl status kamerplanter-data-disk.service)"
+    install -d -m 0700 "$state" "$state/backup" "$backups"
     local booted good from to phase
     booted=$(slot booted digest)
     [ -n "$booted" ] || { echo "not booted from a bootc image"; return 0; }
@@ -342,6 +1011,7 @@ cmd_guard() {
     if [ -z "$good" ]; then
         echo "$booted" >"$state/good"
         log install ok "first boot of $(slot booted version)" "" "$booted"
+        release_check || { write_issue || true; return 1; }
         write_issue || true
         return 0
     fi
@@ -353,13 +1023,31 @@ cmd_guard() {
     elif [ -n "${from-}" ] && [ "$booted" = "$from" ]; then
         # Back on the version the data was backed up under: the update was
         # rolled back, automatically or by hand, so its data goes back too.
-        local detail="the data was not backed up and is unchanged"
-        if [ -d "$state/backup/$from" ]; then
+        local detail="the data was not backed up and is unchanged" source='' problem
+        if [ -e "$backups/$from" ]; then
+            # Recorded: restored only from the location and the disk the
+            # record names, and only when it matches its checksum (D10). A
+            # backup on a disk that is missing is no reason to start on the
+            # data as it is: the services stay stopped until it is back.
+            problem=$(backup_problem "$from")
+            if [ -n "$problem" ]; then
+                restore_refused "$from" "$to" "$problem"
+                write_issue || true
+                return 1
+            fi
+            source=$(backup_dir "$from")
+            detail="data restored from $(backup_where "$(record_field LOCATION "$backups/$from")") to the state before the update; changes made since then are lost"
+        elif [ -d "$state/backup/$from" ]; then
+            # Taken by a release that kept no record: on the system disk,
+            # without a checksum.
+            source=$state/backup/$from
+            detail="data restored to the state before the update; changes made since then are lost"
+        fi
+        if [ -n "$source" ]; then
             # On failure the services stay stopped (they require this unit)
             # and the next boot restores again.
-            copy_volumes "$state/backup/$from" "$volumes" ||
+            { copy_volumes "$source" "$volumes" && restore_marker "$source"; } ||
                 { log rollback error "the data could not be restored; the services stay stopped" "$to" "$from"; return 1; }
-            detail="data restored to the state before the update; changes made since then are lost"
         fi
         echo "$to" >>"$state/failed"
         echo "$booted" >"$state/good"
@@ -376,52 +1064,164 @@ cmd_guard() {
         # the previous version. The release itself is not at fault, so it is
         # not marked as failed and is tried again once the backup can be made.
         from=$good
-        local reason=
-        if ! reason=$(space_ok); then
-            :
-        elif ! { install -d -m 0700 "$state/backup/$from" && copy_volumes "$volumes" "$state/backup/$from"; }; then
-            reason="the data could not be copied for the pre-update backup"
-        fi
-        if [ -n "$reason" ]; then
-            rm -rf "${state:?}/backup/$from"
+        if ! take_backup "$from" "$booted"; then
             rm -f "$state/pending"
-            log guard refused "$reason; returning to the previous version" "$from" "$booted"
+            log guard refused "$backup_failure; returning to the previous version" "$from" "$booted"
             bootc rollback --apply
             return 1
         fi
         printf '%s %s checking\n' "$from" "$booted" >"$state/pending"
         sync "$state/pending"
-        log update backup "data backed up before the first start of $(slot booted version)" "$from" "$booted"
     elif [ -n "${from-}" ]; then
         rm -f "$state/pending"
         log guard cleared "the activation of $(short "$to") did not take place" "$from" "$to"
     fi
+    clear_restore_issue
+    # After the restore above, so a rollback runs on the marker it restored.
+    # On the first boot of a new version the backup is taken already; a
+    # refusal then fails its health check, which returns to the previous one.
+    release_check || { write_issue || true; return 1; }
     write_issue || true
 }
 
-# After the services started, on every boot; acts only while a new version
-# is being checked.
+# After the services started, on every boot. While a new version is being
+# checked, it decides whether that version is healthy, and raises the marker
+# of the data disk when it is. Otherwise, with a data disk, it raises the
+# marker once the services are healthy, when the running release is higher
+# than the marker: on the first boot of an appliance, on a disk it adopted,
+# and on every boot until the marker holds it (E13). The services started by
+# `systemctl restart kamerplanter.target` alone are marked on the next boot.
 cmd_health() {
-    local from to phase booted
+    local from to phase booted problem
     read -r from to phase <<<"$(pending)" || true
     booted=$(slot booted digest)
-    [ "${phase-}" = checking ] && [ "$booted" = "$to" ] || return 0
+    if ! { [ "${phase-}" = checking ] && [ "$booted" = "$to" ]; }; then
+        check_move || return 0
+        mark_when_healthy
+        return 0
+    fi
+    # A move onto the data disk and an update on the same boot are decided
+    # by this one check. When it fails, the update is rolled back, not the
+    # move: the previous version checks the move again on its boot; one that
+    # does not know data disks gets the system copy back (return_move).
+    if ! healthy_now; then
+        problem=$health_problem
+        log health failed "$problem; returning to the previous version" "$from" "$to"
+        # The return happens all the same (E2); the previous version then
+        # keeps its services stopped until the backup can be restored.
+        local unreadable=''
+        if [ -e "$backups/$from" ]; then unreadable=$(readable "$from"); fi
+        if [ -n "$unreadable" ]; then
+            log health warning "the data backup from before the update cannot be restored now: $unreadable; after the return the services stay stopped until it can be" "$from" "$to"
+        fi
+        return_move "$from" "$to"
+        bootc rollback --apply
+        return 1
+    fi
+    echo "$to" >"$state/good"
+    rm -f "$state/pending"
+    log health ok "$(slot booted version) is healthy" "$from" "$to"
+    if [ "$(data_disk_move_field STATE)" = moved ]; then
+        "$disks_tool" move healthy || log health error "the move onto the data disk kp-data could not be recorded as healthy; it is checked again at the next boot"
+    fi
+    raise_marker
+    cleanup
+    write_issue || true
+}
+
+# return_move FROM TO: before the automatic return to FROM (E2), which is
+# never refused. FROM ran before the update, so a data disk it did not know
+# can only have been set up on this boot, by TO, with the move of the system
+# disk's data onto it not yet verified: the system copy is unchanged then,
+# and FROM runs on it. That move is returned to the system copy (disks move
+# unhealthy), so that a later release does not bind the disk over what FROM
+# writes there; nothing is lost, since the return restores the data from
+# before the update anyway. With FROM knowing data disks, the move stays: FROM
+# checks it on its boot.
+return_move() {
+    [ -e "$data_disk_record" ] || return 0
+    [ "$(rollback_support "$1" data-disk)" != supported ] || return 0
+    if [ "$(data_disk_move_field STATE)" = moved ]; then
+        log health warning "the previous version does not know data disks, or cannot be checked for them; the move onto the data disk kp-data is returned to the copy on the system disk, which that version runs on" "$1" "$2"
+        "$disks_tool" move unhealthy "the update failed, and the version returned to does not know data disks" ||
+            log health error "the move onto the data disk kp-data could not be returned to the system copy" "$1" "$2"
+    else
+        log health warning "a data disk is set up, and the previous version does not know data disks, or cannot be checked for them; it runs without the data on that disk" "$1" "$2"
+    fi
+}
+
+# healthy_now: wait_healthy once per run, its result kept for every later
+# caller (check_move, mark_when_healthy): sets health_problem, and fails when
+# the services are not healthy.
+health_state=
+health_problem=
+healthy_now() {
+    if [ -z "$health_state" ]; then
+        if health_problem=$(wait_healthy); then health_state=ok; else health_state=failed; fi
+    fi
+    [ "$health_state" = ok ]
+}
+
+# wait_healthy: waits up to UPDATE_HEALTH_TIMEOUT minutes for check_health;
+# fails with the last problem found when the time is up.
+wait_healthy() {
     local budget deadline problem
     budget=$(count UPDATE_HEALTH_TIMEOUT 20)
     deadline=$(($(date +%s) + budget * 60))
     until problem=$(check_health); do
         if [ "$(date +%s)" -ge "$deadline" ]; then
-            log health failed "$problem after $budget minutes; returning to the previous version" "$from" "$to"
-            bootc rollback --apply
+            echo "$problem after $budget minutes"
             return 1
         fi
         sleep 10
     done
-    echo "$to" >"$state/good"
-    rm -f "$state/pending"
-    log health ok "$(slot booted version) is healthy" "$from" "$to"
-    cleanup
-    write_issue || true
+}
+
+# check_move: after the data was moved onto the data disk
+# (spec/distribution-requirements/ E11), the health check of the services
+# from it, the same check and time budget as for an update (wait_healthy).
+# Healthy: the disk service records the move as verified, and the copy on the
+# system disk is deleted once UPDATE_BACKUP_KEEP_DAYS have passed (cleanup).
+# Not healthy: the disk service returns to the copy on the system disk (a
+# restart of kamerplanter-data-disk.service, which restarts the services as
+# well), unless the disk no longer answers: a missing disk is no failed start,
+# and its services stay stopped until it is back (E12). Fails when the
+# services are being returned or stopped: nothing else is to be checked then.
+check_move() {
+    [ "$(data_disk_move_field STATE)" = moved ] && data_disk_placed || return 0
+    local problem
+    if healthy_now; then
+        "$disks_tool" move healthy ||
+            log health error "the move onto the data disk kp-data could not be recorded as healthy; it is checked again at the next boot"
+        return 0
+    fi
+    problem=$health_problem
+    if ! data_disk_present; then
+        "$disks_tool" move missing "$problem" || true
+    else
+        "$disks_tool" move unhealthy "$problem" || true
+    fi
+    return 1
+}
+
+# mark_when_healthy: raises the marker of the data disk once the services of
+# a release that would raise it are healthy, by the same health check as an
+# update. Not on a disk this release is refused on: its services stay
+# stopped. A check that fails leaves the marker as it is, and is recorded.
+mark_when_healthy() {
+    [ -e "$data_disk_record" ] && data_disk_placed || return 0
+    local disk running
+    disk=$(data_disk_release)
+    running=$(running_release)
+    marker_raises "$running" "$disk" || return 0
+    if marker_refuses "$disk" "$running" && ! downgrade_allowed "$disk" "$running" "$state/downgrades"; then
+        return 0
+    fi
+    if ! healthy_now; then
+        log release unmarked "$health_problem; the data disk kp-data stays marked by ${disk:-no release}"
+        return 0
+    fi
+    raise_marker
 }
 
 check_health() {
@@ -446,32 +1246,107 @@ check_health() {
 }
 
 # Backups older than UPDATE_BACKUP_KEEP_DAYS are deleted; a manual rollback
-# needs one, so it is possible only within that period (spec D4).
+# needs one, so it is possible only within that period (spec D4). The same
+# period after the services passed the health check from a data disk the
+# data was moved onto, the disk service deletes the copy of that data on the
+# system disk (spec/distribution-requirements/ E11), and records it in
+# /var/lib/kamerplanter/disks/log.jsonl. Run daily by
+# kamerplanter-update-fetch.service, also when nothing could be fetched, and
+# after a healthy update.
+#
+# A backup is deleted where its record says it is (D4): once the period from
+# the time it was taken is over, with its record. When its disk is missing
+# then, it is kept, the deletion is recorded as pending (status shows it),
+# and done once the disk is back (D10). The backup of the version an update
+# being checked or a requested rollback returns to is never deleted. A backup
+# no record names (taken by a release that kept none, or left by a backup
+# that did not complete) is deleted at any location that is available, once
+# its directory is older than that period.
 cleanup() {
-    local keep dir
-    keep=$(count UPDATE_BACKUP_KEEP_DAYS 7)
-    for dir in "$state"/backup/*/; do
-        [ -d "$dir" ] || continue
-        if [ -n "$(find "$dir" -maxdepth 0 -mtime "+$((keep - 1))")" ]; then
-            rm -rf "$dir"
-            log cleanup ok "deleted the pre-update backup of $(short "$(basename "$dir")")"
+    local keep now protect rec d loc epoch problem base
+    # Under the lock of the update actions, so that no rollback or activation
+    # relies on a backup that is being deleted; fetch takes it before.
+    if ! update_lock; then
+        echo "another update action is running; the backups are cleaned up at the next run" >&2
+        return 0
+    fi
+    keep=$(keep_period)
+    now=$(date +%s)
+    read -r protect _ <<<"$(pending)" || true
+    for rec in "$backups"/*; do
+        [ -f "$rec" ] || continue
+        d=${rec##*/}
+        [ "$d" != "${protect-}" ] || continue
+        epoch=$(date -d "$(record_field TAKEN "$rec")" +%s 2>/dev/null) || epoch=
+        cleanup_due "$epoch" "$keep" "$now" || continue
+        loc=$(record_field LOCATION "$rec")
+        problem=$(readable "$d")
+        if [ -n "$problem" ]; then
+            if [ -z "$(record_field DELETE_PENDING "$rec")" ]; then
+                write_record "$rec" DELETE_PENDING="$(date -u +%FT%TZ)" || true
+                log cleanup pending "the pre-update backup of $(short "$d") is due for deletion, but $problem; it is deleted once that disk is back"
+            fi
+            continue
+        fi
+        if backup_delete "$loc" "$d" && rm -f -- "$rec"; then
+            log cleanup ok "deleted the pre-update backup of $(short "$d") from $(backup_where "$loc")"
+        else
+            log cleanup error "the pre-update backup of $(short "$d") on $(backup_where "$loc") could not be deleted; it is tried again at the next run"
         fi
     done
+    for loc in "${backup_locations[@]}"; do
+        [ "$(location_state "$loc")" = ok ] || continue
+        # Only the directories named as backups, never through a link
+        # (backup_entries in /usr/lib/kamerplanter/env.sh).
+        base=$(backup_base "$loc")
+        while IFS= read -r d; do
+            [ "$d" != "${protect-}" ] || continue
+            [ "$(record_field LOCATION "$backups/$d")" != "$loc" ] || continue
+            [ -n "$(find "$base/$d" -maxdepth 0 -mtime "+$((keep - 1))")" ] || continue
+            if backup_delete "$loc" "$d"; then
+                log cleanup ok "deleted the pre-update backup of $(short "$d") from $(backup_where "$loc")"
+            else
+                log cleanup error "the pre-update backup of $(short "$d") on $(backup_where "$loc") could not be deleted; it is tried again at the next run"
+            fi
+        done < <(backup_entries "$loc")
+    done
+    if [ "$(data_disk_move_field STATE)" = verified ]; then
+        "$disks_tool" cleanup "$keep" ||
+            log cleanup error "the copy on the system disk of the data moved onto the data disk kp-data could not be deleted; it is tried again at the next run (see /var/lib/kamerplanter/disks/log.jsonl)"
+    fi
 }
 
 case ${1-status} in
+    allow-downgrade) [ "$(id -u)" = 0 ] || die "allow-downgrade must be run as root"; refresh ;;
     status | fetch | apply | apply-now | rollback | guard | health | issue) refresh ;;
 esac
 case ${1-status} in
     status) shift || true; cmd_status "$@" ;;
-    fetch) cmd_fetch; cleanup ;;
+    fetch)
+        # The cleanup runs also when nothing could be fetched, as on an
+        # appliance without network; the fetch keeps set -e in its subshell.
+        # The lock is taken here, so the subshell and the cleanup after it
+        # hold it both; without it, neither runs.
+        update_lock || die "another update action is running"
+        set +e
+        (set -e; cmd_fetch)
+        rc=$?
+        set -e
+        cleanup
+        exit "$rc"
+        ;;
     apply) shift; cmd_apply "$@" ;;
-    apply-now) cmd_fetch && cmd_apply --now ;;
+    # Not cmd_fetch && ...: set -e would not hold inside cmd_fetch there.
+    apply-now)
+        cmd_fetch
+        cmd_apply --now
+        ;;
     postpone) shift; cmd_postpone "$@" ;;
     resume) cmd_resume ;;
     rollback) cmd_rollback ;;
+    allow-downgrade) shift; cmd_allow_downgrade "$@" ;;
     guard) cmd_guard ;;
     health) cmd_health ;;
     issue) write_issue ;;
-    *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+    *) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
