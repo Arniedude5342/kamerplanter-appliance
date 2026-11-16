@@ -1,0 +1,239 @@
+#!/usr/bin/bash
+# Takes the Kamerplanter settings from the provisioning data into the
+# provisioning layer, and stages its secrets for the configuration check
+# (spec/distribution-requirements/ L9, L10, L12, L17). Run by
+# kamerplanter-provisioning.service on every boot, after cloud-init's network
+# stage and before the configuration check (kamerplanter-config.service).
+#
+# The provisioning layer (provisioning_layer in /usr/lib/kamerplanter/env.sh)
+# lies in /var/lib/kamerplanter/provisioning/ on the system disk, root only:
+#   provisioning.env  written by cloud-init's write_files, once per instance,
+#                     in the format of the user file; read as it is
+#   settings.env      written here from the map kamerplanter: -> settings: of
+#                     the cloud-config; loaded after provisioning.env, so the
+#                     map wins for a key both set
+# Neither is the user file, which this never writes.
+#
+# The map is read from the cloud-config that cloud-init combines from its own
+# configuration, the vendor-data and the user-data, and writes to
+# /run/cloud-init/combined-cloud-config.json (root, 0600) on every boot it
+# runs, in its network stage. settings.env is renewed from it on every boot on
+# which cloud-init found provisioning data, an empty map included; on a boot
+# without, when cloud-init is disabled or fell back to its datasource None, it
+# stays as it is, so the settings hold after the source is detached (L10,
+# L20). Nothing here waits for cloud-init: the unit is only ordered after it.
+#
+# Each entry of the map becomes one KEY=VALUE line; a text, a number or a
+# boolean is written as its text (true, false), an empty value as KEY=. An
+# entry that cannot be such a line, a key that is no KEY name, a value that
+# is a list or a map or spans lines, becomes a line that says so and is not
+# KEY=VALUE, so the configuration check keeps the services stopped and names
+# it, as it does for any line of the user file (L11). Values are never
+# printed: this runs into the journal.
+#
+# The map kamerplanter: -> secrets: is staged for the configuration check
+# (L12, L17), never written into the provisioning layer: as KEY=VALUE lines
+# in staged_secrets, in a directory of mode 0700 in /run, with the id of the
+# instance in staged_instance (both in /usr/lib/kamerplanter/env.sh). The
+# check takes them into the secrets file once the data disk is in place and
+# deletes them. Once it has, it records the instance in secrets_taken, and
+# from then on the map of that instance is not staged again; a boot with a
+# new instance stages anew. A value is never printed, nor passed on a
+# command line: jq writes the lines straight into the staged file. An entry
+# that cannot be such a line, a key that is no KEY name, a value that is no
+# text or holds a line break or another control character, is staged as a
+# line that says so, and the check keeps the services stopped for it.
+#
+# At boot the maintenance window generator runs before /var is mounted and
+# does not see the provisioning layer; once it is in place, systemd is
+# reloaded when the window differs, so a provisioned UPDATE_WINDOW holds from
+# the first boot (L17). That is checked on every boot, also without
+# provisioning data.
+set -euo pipefail
+umask 077
+
+combined=/run/cloud-init/combined-cloud-config.json
+instance_data=/run/cloud-init/instance-data.json
+
+# shellcheck source=image/rootfs/usr/lib/kamerplanter/env.sh
+. /usr/lib/kamerplanter/env.sh
+
+# Replaces a file with what stdin delivers, durably: a reader sees either the
+# old or the new content, and the new content survives a power loss.
+replace() {
+    local tmp
+    tmp=$(mktemp "$(dirname "$1")/.$(basename "$1").XXXXXX")
+    cat >"$tmp"
+    sync "$tmp"
+    mv "$tmp" "$1"
+    sync "$(dirname "$1")"
+}
+
+# provided: whether cloud-init found provisioning data on this boot: it ran
+# (its combined cloud-config is in /run) with a datasource other than None.
+provided() {
+    local platform
+    [ -f "$combined" ] && [ -f "$instance_data" ] || return 1
+    platform=$(jq -r '.v1.platform // empty' "$instance_data" 2>/dev/null) || return 1
+    [ -n "$platform" ] && [ "$platform" != none ]
+}
+
+# settings_lines: the lines of settings.env from the combined cloud-config on
+# stdin. Fails when it is not JSON. A key is matched with \A and \z: jq's $
+# also matches before a final line break, which would split the line. jq's
+# messages are dropped: they could quote the input.
+settings_lines() {
+    jq -r '
+        def entry:
+            .key as $k | .value as $v
+            | if ($k | test("\\A[A-Za-z_][A-Za-z0-9_]*\\z") | not) then
+                "invalid entry of kamerplanter: -> settings:, the key \($k | @json) is no KEY name"
+              elif $v == null then "\($k)="
+              elif ($v | type) == "string" then
+                if ($v | test("[\u0000\r\n]")) then "invalid entry of kamerplanter: -> settings:, the value of \($k) spans several lines"
+                else "\($k)=\($v)" end
+              elif ($v | type) == "number" or ($v | type) == "boolean" then "\($k)=\($v | tostring)"
+              else "invalid entry of kamerplanter: -> settings:, the value of \($k) is a \($v | type), not a single value"
+              end;
+        (.kamerplanter // {}) as $kp
+        | if ($kp | type) != "object" then "invalid entry of the provisioning data: kamerplanter: is not a map"
+          else ($kp.settings // {}) as $s
+          | if ($s | type) != "object" then "invalid entry of the provisioning data: kamerplanter: -> settings: is not a map"
+            else $s | to_entries[] | entry
+            end
+          end' 2>/dev/null
+}
+
+# secret_lines: the lines of staged_secrets from the combined cloud-config on
+# stdin; nothing when kamerplanter: is no map, which settings_lines reports.
+# Fails when it is not JSON. jq's messages are dropped: they could quote the
+# input.
+secret_lines() {
+    jq -r '
+        def entry:
+            .key as $k | .value as $v
+            | if ($k | test("\\A[A-Za-z_][A-Za-z0-9_]*\\z") | not) then
+                "invalid entry of kamerplanter: -> secrets:, a key that is no KEY name"
+              elif ($v | type) != "string" then
+                "invalid entry of kamerplanter: -> secrets:, the value of \($k) is \(if $v == null then "empty" else "a \($v | type)" end), not a text; quote it"
+              elif ($v | test("[\u0000-\u001f\u007f]")) then
+                "invalid entry of kamerplanter: -> secrets:, the value of \($k) holds a line break or another control character"
+              else "\($k)=\($v)" end;
+        (.kamerplanter // {}) as $kp
+        | if ($kp | type) != "object" then empty
+          else ($kp.secrets // {}) as $s
+          | if ($s | type) != "object" then "invalid entry of the provisioning data: kamerplanter: -> secrets: is not a map"
+            else $s | to_entries[] | entry
+            end
+          end' 2>/dev/null
+}
+
+# instance_id: cloud-init's id of this instance, as one line of JSON; null
+# when it names none.
+instance_id() {
+    local id
+    id=$(jq -c '.v1.instance_id // null' "$instance_data" 2>/dev/null) || id=null
+    [ -n "$id" ] && [[ $id != *$'\n'* ]] || id=null
+    printf '%s' "$id"
+}
+
+# stage_secrets: stages kamerplanter: -> secrets: of this boot's provisioning
+# data for the configuration check, unless the map of this instance was
+# taken over already. Whatever was staged before is removed first, once this
+# boot's provisioning data is there: a restart of the step after the scrub
+# keeps what is staged for the configuration check.
+stage_secrets() {
+    local id tmp count
+    if [ -L "$provisioning_staging" ] || { [ -e "$provisioning_staging" ] && [ ! -d "$provisioning_staging" ]; }; then
+        echo "$provisioning_staging is not a directory; no provisioned secret is staged" >&2
+        return 0
+    fi
+    provided || return 0
+    rm -rf -- "$provisioning_staging"
+    id=$(instance_id)
+    if [ -f "$secrets_taken" ] && [ ! -L "$secrets_taken" ] && [ "$(head -n1 -- "$secrets_taken")" = "$id" ]; then
+        echo "the secrets of this provisioning instance were taken over on an earlier boot; kamerplanter: -> secrets: is not taken over again"
+        return 0
+    fi
+    install -d -m 0700 "$provisioning_staging"
+    chown root:root "$provisioning_staging"
+    chmod 0700 "$provisioning_staging"
+    tmp=$(mktemp "$provisioning_staging/.secrets.XXXXXX")
+    if ! secret_lines <"$combined" >"$tmp"; then
+        rm -rf -- "$provisioning_staging"
+        echo "the combined cloud-config of cloud-init cannot be read; no provisioned secret is staged" >&2
+        return 0
+    fi
+    printf '%s\n' "$id" >"$provisioning_staging/.instance"
+    mv -- "$provisioning_staging/.instance" "$staged_instance"
+    mv -- "$tmp" "$staged_secrets"
+    count=$(grep -c . "$staged_secrets" || true)
+    echo "$count entries of kamerplanter: -> secrets: staged for the configuration check"
+}
+
+# own_dir: the directory of the layer, root only (0700), created when missing;
+# fails, and says why, when it is not a directory of its own.
+own_dir() {
+    if [ -L "$provisioning_dir" ] || { [ -e "$provisioning_dir" ] && [ ! -d "$provisioning_dir" ]; }; then
+        echo "$provisioning_dir is not a directory; the provisioning layer is not renewed" >&2
+        return 1
+    fi
+    install -d -m 0700 "$provisioning_dir"
+    chown root:root "$provisioning_dir"
+    chmod 0700 "$provisioning_dir"
+}
+
+# own_file FILE: FILE of the layer root only (0600) when it is a regular file;
+# write_files creates it with the mode the provisioning data gives, 0644 by
+# default.
+own_file() {
+    [ -e "$1" ] || [ -L "$1" ] || return 0
+    if [ -L "$1" ] || [ ! -f "$1" ]; then
+        echo "$1 is not a regular file; write it with write_files as a plain file" >&2
+        return 0
+    fi
+    chown root:root "$1"
+    chmod 0600 "$1"
+}
+
+renew() {
+    local lines count
+    if ! provided; then
+        echo "no provisioning data on this boot; the provisioning layer is kept as it is"
+        return 0
+    fi
+    own_dir || return 0
+    own_file "$provisioning_file"
+    if ! lines=$(settings_lines <"$combined"); then
+        echo "the combined cloud-config of cloud-init cannot be read; the provisioning layer is kept as it is" >&2
+        return 0
+    fi
+    count=0
+    [ -z "$lines" ] || count=$(printf '%s\n' "$lines" | wc -l)
+    {
+        echo "# Written by kamerplanter-provisioning.service from kamerplanter: -> settings:"
+        echo "# of the provisioning data on every boot that has provisioning data; edits"
+        echo "# are lost. Set your own values in $config_user, which wins."
+        [ -z "$lines" ] || printf '%s\n' "$lines"
+    } | replace "$provisioning_settings"
+    own_file "$provisioning_settings"
+    echo "provisioning layer renewed from the provisioning data: $count entries of kamerplanter: -> settings:"
+}
+
+# refresh_window: brings a provisioned UPDATE_WINDOW into effect, as the
+# disk service does for the user file of a data disk (refresh_window in
+# /usr/libexec/kamerplanter/disks). A failed reload leaves the window read at
+# boot until the next reload; the services start all the same.
+refresh_window() {
+    [ -d /run/systemd/system ] || return 0
+    window_stale || return 0
+    if timeout 120 systemctl daemon-reload; then
+        echo "maintenance window reloaded with the provisioning layer in place"
+    else
+        echo "the maintenance window of the provisioning layer is not in effect: systemctl daemon-reload failed" >&2
+    fi
+}
+
+renew
+stage_secrets
+refresh_window

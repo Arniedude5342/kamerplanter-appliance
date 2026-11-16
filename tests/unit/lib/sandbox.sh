@@ -16,6 +16,11 @@ sandbox_paths=(
     /var/mnt/
     /run/kamerplanter
     /run/issue.d
+    /run/cloud-init/
+    /var/lib/cloud/
+    /var/log/
+    /run/systemd/generator/
+    /usr/lib/systemd/system-generators/
     /sysroot/
 )
 

@@ -25,6 +25,20 @@ LABEL org.opencontainers.image.title="Kamerplanter appliance" \
       org.opencontainers.image.vendor="Kamerplanter" \
       org.opencontainers.image.licenses="MIT"
 
+# cloud-init reads the provisioning data: hostname, network, SSH keys and the
+# Kamerplanter settings (spec/distribution-requirements/ §L).
+# /etc/cloud/cloud.cfg.d/50-kamerplanter.cfg sets its sources and policy;
+# without a source its generator keeps it disabled.
+# The install leaves state in /run, /var/cache, /var/lib and /var/log that the
+# base image does not carry and bootc container lint warns about; it is
+# removed. /var/lib/cloud is created at boot by usr/lib/tmpfiles.d/
+# kamerplanter-cloud-init.conf, /run/cloud-init by cloud-init's own entry and
+# /var/lib/dhcpcd by dhcpcd's.
+RUN dnf -y install cloud-init \
+    && dnf clean all \
+    && rm -rf /run/cloud-init /run/dnf /var/cache /var/lib/cloud \
+        /var/lib/dhcpcd /var/lib/dnf /var/log
+
 COPY rootfs/ /
 
 # The public half of the shared key that signs released system images.
@@ -44,10 +58,13 @@ RUN install -d -m 0755 /usr/share/kamerplanter/keys \
     && chmod 0644 /usr/share/kamerplanter/keys/system-image.pub
 
 RUN chmod 0755 /usr/libexec/kamerplanter/configure /usr/libexec/kamerplanter/disks \
+        /usr/libexec/kamerplanter/provisioning /usr/libexec/kamerplanter/scrub-cloud-init \
         /usr/bin/kamerplanter-update \
         /usr/lib/systemd/system-generators/kamerplanter-update-window \
     && chmod 0700 /etc/kamerplanter && chmod 0600 /etc/kamerplanter/kamerplanter.env \
     && systemctl enable kamerplanter.target kamerplanter-config.service \
+        kamerplanter-provisioning.service kamerplanter-cloud-init-scrub.service \
+        kamerplanter-metadata-guard.service \
         kamerplanter-data-disk.service kamerplanter-backup-disk.service \
         kamerplanter-update-guard.service kamerplanter-update-health.service \
         kamerplanter-update-fetch.timer kamerplanter-update-apply.timer \
