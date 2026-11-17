@@ -190,12 +190,76 @@ rm -rf "$SB/var/lib/cloud" "$SB/run"
 expect "no cloud-init directories at all: the scrub succeeds" 0 "$(run_scrub)"
 
 # --- copies left by a boot that ended before the scrub, now without a
-# source: they are deleted all the same ---
+# source: the values are learned from the copies, the logs scrubbed, the
+# copies deleted (#30) ---
 new_appliance
 booted iid-1
 rm -rf "$SB/run"
 expect "copies left from an earlier boot, without a source now: deleted" "0|no|no|iid-1" \
     "$(run_scrub)|$(exists "$SB/var/lib/cloud/instances/iid-1/user-data.txt")|$(exists "$SB/var/lib/cloud/instances/iid-1/obj.pkl")|$(cat "$SB/var/lib/cloud/data/instance-id")"
+expect "copies left from an earlier boot: the logs are scrubbed with the values learned from them, and kept" "none|yes|yes" \
+    "$(found "$SB"/var/log/cloud-init*.log)|$(has "secret REDACTED and REDACTED in one line" "$(cat "$SB/var/log/cloud-init.log")")|$(has "run: REDACTED" "$(cat "$SB/var/log/cloud-init-output.log")")"
+
+# A copy of the cloud-config that cannot be read: its values are unknown, so
+# cloud-init's logs go, rotated ones included; other logs stay.
+new_appliance
+booted iid-1
+rm -rf "$SB/run"
+printf 'kamerplanter: [unclosed\n' >"$SB/var/lib/cloud/instances/iid-1/cloud-config.txt"
+cp "$SB/var/log/cloud-init.log" "$SB/var/log/cloud-init.log.1"
+echo "untouched" >"$SB/var/log/messages"
+rc=$(run_scrub)
+expect "an unreadable copy: cloud-init's logs are deleted, rotated ones too, other logs stay, the copies go" "0|no|no|no|yes|no" \
+    "$rc|$(exists "$SB/var/log/cloud-init.log")|$(exists "$SB/var/log/cloud-init-output.log")|$(exists "$SB/var/log/cloud-init.log.1")|$(exists "$SB/var/log/messages")|$(exists "$SB/var/lib/cloud/instances/iid-1/cloud-config.txt")"
+expect "an unreadable copy: the scrub names it and says why the logs go" yes \
+    "$(has "$SB/var/lib/cloud/instances/iid-1/cloud-config.txt cannot be read; the provisioned secrets in it are not known, so cloud-init's logs are deleted" "$(out)")"
+
+# A copy with a date and a tag JSON does not know is still read: the logs
+# are scrubbed, not deleted.
+new_appliance
+booted iid-1
+printf 'expires: 2026-12-01\nblob: !!binary aGVsbG8=\n' >>"$SB/var/lib/cloud/instances/iid-1/cloud-config.txt"
+expect "a copy with a date and a binary tag: read, the logs are scrubbed and kept" "0|yes|none" \
+    "$(run_scrub)|$(exists "$SB/var/log/cloud-init.log")|$(found "$SB"/var/log/cloud-init*.log)"
+
+# Without the YAML module the copies cannot be read: the unit fails, nothing
+# is deleted.
+new_appliance
+booted iid-1
+mkdir -p "$SB/stub"
+printf '#!/usr/bin/env bash\ncase "$*" in *"import yaml"*) exit 1 ;; esac\nexec %q "$@"\n' "$(command -v python3)" >"$SB/stub/python3"
+chmod +x "$SB/stub/python3"
+rc=$(PATH=$SB/stub:$PATH run_scrub)
+expect "no YAML module: the scrub fails, says so, and deletes nothing" "1|yes|yes|yes" \
+    "$rc|$(has "Python has no YAML module" "$(out)")|$(exists "$SB/var/log/cloud-init.log")|$(exists "$SB/var/lib/cloud/instances/iid-1/user-data.txt")"
+
+# A file outside the logs that starts like a compressed one is searched as it
+# is, never deleted.
+new_appliance
+booted iid-1
+printf '\x1f\x8bnot really gzip' >"$SB/var/lib/cloud/data/instance-id.bak"
+expect "a non-log file that looks compressed is kept" "0|yes" \
+    "$(run_scrub)|$(exists "$SB/var/lib/cloud/data/instance-id.bak")"
+
+# --- rotated logs (#30): plain ones are scrubbed, compressed ones that hold a
+# value or cannot be read are deleted, the others kept ---
+new_appliance
+booted iid-1
+log=$SB/var/log/cloud-init.log
+cp "$log" "$SB/var/log/cloud-init.log.1"
+cp "$log" "$SB/var/log/cloud-init-output.log-20261116"
+gzip -c "$log" >"$SB/var/log/cloud-init.log.2.gz"
+printf 'nothing secret\n' | gzip -c >"$SB/var/log/cloud-init.log.3.gz"
+printf 'nothing secret\n' | xz -c >"$SB/var/log/cloud-init.log.4.xz"
+cp "$log" "$SB/var/log/cloud-init.log.5" && bzip2 "$SB/var/log/cloud-init.log.5"
+printf '\x1f\x8bnot really gzip' >"$SB/var/log/cloud-init.log.6.gz"
+rc=$(run_scrub)
+expect "rotated logs: the scrub succeeds, plain rotated logs are scrubbed and kept" "0|none|yes|yes" \
+    "$rc|$(found "$SB/var/log/cloud-init.log.1" "$SB/var/log/cloud-init-output.log-20261116")|$(has "secret REDACTED and REDACTED in one line" "$(cat "$SB/var/log/cloud-init.log.1")")|$(exists "$SB/var/log/cloud-init-output.log-20261116")"
+expect "rotated logs: compressed ones with a value or unreadable are deleted, the others kept" "no|yes|yes|no|no" \
+    "$(exists "$SB/var/log/cloud-init.log.2.gz")|$(exists "$SB/var/log/cloud-init.log.3.gz")|$(exists "$SB/var/log/cloud-init.log.4.xz")|$(exists "$SB/var/log/cloud-init.log.5.bz2")|$(exists "$SB/var/log/cloud-init.log.6.gz")"
+expect "rotated logs: the scrub names the deleted compressed logs and counts them" "yes|yes" \
+    "$(has "deleted $SB/var/log/cloud-init.log.2.gz: a compressed file that holds provisioned secrets or cannot be read" "$(out)")|$(has "compressed logs with provisioned secrets deleted: 3" "$(out)")"
 
 # --- seed files are the source, not a copy: kept, and warned about (L3, L20) ---
 new_appliance
@@ -256,8 +320,8 @@ rc=$(run_scrub)
 chmod 0700 "$SB/var/lib/cloud/data"
 expect "a file that cannot be rewritten: the scrub fails and names it, never the value" "1|yes|no" \
     "$rc|$(has "$SB/var/lib/cloud/data/status.json still holds provisioned secrets" "$(out)")|$(has "$quoted" "$(out)")"
-expect "a file that cannot be rewritten: the rest is scrubbed all the same" "no|none" \
-    "$(exists "$SB/var/lib/cloud/instances/iid-1/user-data.txt")|$(found "$SB"/var/log/cloud-init*.log "$SB/run/cloud-init")"
+expect "a file that cannot be rewritten: the rest is scrubbed, the copies are kept for the next boot to retry" "yes|none|yes" \
+    "$(exists "$SB/var/lib/cloud/instances/iid-1/user-data.txt")|$(found "$SB"/var/log/cloud-init*.log)|$(has "copies of the provisioning data are kept until the next boot retries" "$(out)")"
 
 # --- the units (L15, L16) ---
 units=$image/usr/lib/systemd/system
