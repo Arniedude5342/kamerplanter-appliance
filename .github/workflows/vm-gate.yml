@@ -1,0 +1,76 @@
+name: vm-gate
+
+# Sets the commit status `vm-gate`, a required check on develop
+# (.github/settings.yml), on the head of every pull request (#43):
+#   success  the pull request changes nothing the VM tests cover;
+#   failure  it changes what they cover but lacks the label `vm-tests`;
+#   pending  it has the label: the report job of vm-tests.yml sets the
+#            result once the VM suites of that commit are through.
+# The VM tests cover what vm-tests.yml runs on after a merge to develop: the
+# image, the build, the boot and image tests, and the two workflows.
+#
+# pull_request_target: the gate runs as develop has it, so a pull request
+# cannot rewrite the gate it is judged by. That is safe here because only the
+# GitHub API is read; the pull request's code is never checked out.
+
+on:
+  pull_request_target:
+    branches: [develop]
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: vm-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: vm-gate-decision
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      NUMBER: ${{ github.event.pull_request.number }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+      BASE: ${{ github.event.pull_request.base.sha }}
+      ACTION: ${{ github.event.action }}
+      LABEL: ${{ github.event.label.name }}
+      HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'vm-tests') }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Set the vm-gate status
+        run: |
+          set -euo pipefail
+          status() {
+            gh api -X POST "repos/$REPO/statuses/$SHA" -f context=vm-gate \
+              -f state="$1" -f description="$2" -f target_url="$RUN_URL" >/dev/null
+            echo "vm-gate: $1 ($2)"
+          }
+          # The files of exactly this head, not of whatever the pull request
+          # shows by now. The comparison lists at most 300 files; a larger
+          # change counts as covered.
+          files=$(gh api "repos/$REPO/compare/$BASE...$SHA" --jq '.files | length, (.[].filename)')
+          covered=$(tail -n +2 <<<"$files" |
+            grep -cE '^(image/|build/|tests/boot/|tests/image/|\.github/workflows/vm-(tests|gate)\.yml$)' || true)
+          [ "$(head -n1 <<<"$files")" -lt 300 ] || covered=many
+          if [ "$covered" = 0 ]; then
+            status success "no change the VM tests cover"
+          elif [ "$HAS_LABEL" != true ]; then
+            status failure "changes the image, build or boot tests: add the label vm-tests"
+          elif [ "$ACTION" = opened ] || [ "$ACTION" = synchronize ] ||
+            { [ "$ACTION" = labeled ] && [ "$LABEL" = vm-tests ]; }; then
+            # A new head or the label just set: the VM tests start now.
+            status pending "waiting for the VM tests of this commit"
+          elif [ -z "$(gh api "repos/$REPO/commits/$SHA/statuses" --jq '[.[] | select(.context == "vm-gate")] | first | .state // empty')" ]; then
+            # No result for this head, and nothing starts the VM tests now.
+            status failure "no VM test result for this commit: remove and add the label vm-tests"
+          else
+            # Reopened, or another label changed: vm-tests.yml does not run
+            # again, so the result of its last run for this head stands.
+            echo "vm-gate: unchanged"
+          fi
