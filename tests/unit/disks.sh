@@ -355,6 +355,106 @@ expect "identity: a partition by its number" "serial:S3Z1NB0K:part2" "$(device_i
 expect "identity: the device number without either" "devno:7:3" "$(device_identity '' '' '' 7:3)"
 expect "identity: unprintable characters replaced" "serial:a?b" "$(device_identity '' $'a\nb' '' 8:0)"
 
+# --- the disk selected is checked again, locked, before it is wiped or formatted ---
+expect "same disk: nothing changed" "" "$(identity_problem /dev/sdb 8:16 serial:A /dev/sdb 8:16 serial:A)"
+expect "same disk: the naming leads elsewhere" "it leads to /dev/sdc now, not to /dev/sdb" \
+    "$(identity_problem /dev/sdb 8:16 serial:A /dev/sdc 8:32 serial:B)"
+expect "same disk: the naming leads nowhere" "it leads to no device now, not to /dev/sdb" \
+    "$(identity_problem /dev/sdb 8:16 serial:A '' '' '')"
+expect "same disk: renumbered" "/dev/sdb has the device number 8:32 now, not 8:16" \
+    "$(identity_problem /dev/sdb 8:16 serial:A /dev/sdb 8:32 serial:A)"
+expect "same disk: gone" "/dev/sdb has the device number none now, not 8:16" \
+    "$(identity_problem /dev/sdb 8:16 serial:A /dev/sdb '' devno:)"
+expect "same disk: another disk under the same name and number" "/dev/sdb is serial:B now, not serial:A" \
+    "$(identity_problem /dev/sdb 8:16 serial:A /dev/sdb 8:16 serial:B)"
+expect "same disk: a partition of another disk" "/dev/sdb1 is wwn:0x2:part1 now, not wwn:0x1:part1" \
+    "$(identity_problem /dev/sdb1 8:17 wwn:0x1:part1 /dev/sdb1 8:17 wwn:0x2:part1)"
+same_disk_with() {  # same_disk_with NOW_DEV NOW_DEVNO NOW_IDENT NOW_NODE [named]: same_disk on /dev/sdb 8:16 serial:A node 5:100, with the naming, lsblk, sysfs and the node faked
+    (
+        name=/dev/disk/by-id/usb-a now_dev=$1 now_devno=$2 now_ident=$3 now_node=$4
+        unset disk_lock
+        readlink() { printf '%s\n' "$now_dev"; }
+        lsblk_field() { printf '%s' "$now_devno"; }
+        identity_of() { printf '%s' "$now_ident"; }
+        device_node() { printf '%s' "$now_node"; }
+        die() { echo "die: $1"; exit 1; }
+        same_disk /dev/sdb 8:16 serial:A 5:100 "${5-}"
+        echo written
+    )
+}
+expect "same disk: the write goes ahead" written "$(same_disk_with /dev/sdb 8:16 serial:A 5:100)"
+expect "same disk: another disk stops the start before the write" \
+    "die: /dev/disk/by-id/usb-a (/dev/sdb) is not formatted, as it is no longer the disk selected: /dev/sdb is serial:B now, not serial:A; nothing is written to it" \
+    "$(same_disk_with /dev/sdb 8:16 serial:B 5:100)"
+expect "same disk: a disk without serial replaced under the same number stops the start" \
+    "die: /dev/disk/by-id/usb-a (/dev/sdb) is not formatted, as it is no longer the disk selected: /dev/sdb is another device node now: a disk replaced it; nothing is written to it" \
+    "$(same_disk_with /dev/sdb 8:16 serial:A 5:200)"
+expect "same disk: a naming that leads elsewhere stops the start before the write" \
+    "die: /dev/disk/by-id/usb-a (/dev/sdb) is not formatted, as it is no longer the disk selected: it leads to /dev/sdc now, not to /dev/sdb; nothing is written to it" \
+    "$(same_disk_with /dev/sdc 8:16 serial:A 5:100 named)"
+expect "same disk: after the first write the naming is not looked at again" written "$(same_disk_with /dev/sdc 8:16 serial:A 5:100)"
+expect "same disk: nothing recorded to compare with stops the start" \
+    "die: /dev/disk/by-id/usb-a (/dev/sdb) cannot be identified: it had no device number or node when it was selected; nothing is written to it" \
+    "$(
+        (
+            name=/dev/disk/by-id/usb-a
+            unset disk_lock
+            die() { echo "die: $1"; exit 1; }
+            same_disk /dev/sdb 8:16 serial:A ''
+            echo written
+        )
+    )"
+expect "same disk: the locked whole disk replaced stops the start" \
+    "die: /dev/disk/by-id/usb-a (/dev/sdb1) is not formatted, as it is no longer the disk selected: /dev/sdb, which is locked, is another device node now: a disk replaced it; nothing is written to it" \
+    "$(
+        (
+            name=/dev/disk/by-id/usb-a disk_lock=9 disk_lock_whole=/dev/sdb disk_lock_node=5:100
+            lsblk_field() { printf 8:17; }
+            identity_of() { printf serial:A:part1; }
+            device_node() { if [ "$1" = /dev/sdb ]; then printf 5:200; else printf 5:101; fi; }
+            die() { echo "die: $1"; exit 1; }
+            same_disk /dev/sdb1 8:17 serial:A:part1 5:101
+            echo written
+        )
+    )"
+lockee=$work/disk.img
+: >"$lockee"
+locked_by_other() { if flock -n -x "$lockee" true; then echo free; else echo locked; fi; }
+expect "lock: taken on the device, released by unlock_disk" "locked|free" "$(
+    (
+        lsblk_field() { :; }
+        die() { echo "die: $1"; exit 1; }
+        lock_disk "$lockee"
+        printf '%s|' "$(locked_by_other)"
+        unlock_disk
+        locked_by_other
+    )
+)"
+expect "lock: held by another program, the start stops without writing" \
+    "die: $lockee, holding /dev/disk/by-id/usb-a, is locked by another program; it is not formatted" "$(
+    (
+        exec 8<"$lockee"
+        flock -x 8
+        name=/dev/disk/by-id/usb-a wait_seconds=0
+        lsblk_field() { :; }
+        die() { echo "die: $1"; exit 1; }
+        lock_disk "$lockee"
+        echo written
+    )
+)"
+
+expect "lock: a partition whose disk cannot be found stops the start" \
+    "die: /dev/sdb1, holding /dev/disk/by-id/usb-a, is a partition whose disk cannot be found to lock it; it is not formatted" "$(
+    (
+        name=/dev/disk/by-id/usb-a
+        lsblk_field() { if [ "$2" = TYPE ]; then printf part; fi; }
+        kname() { printf sdb1; }
+        die() { echo "die: $1"; exit 1; }
+        lock_disk /dev/sdb1
+        echo written
+    )
+)"
+
 # --- no key on the kernel command line (W5) ---
 cmd=$work/cmdline
 on_cmdline() { printf '%s\n' "$1" >"$cmd"; if cmdline_key "$cmd" "$2"; then echo refused; else echo fine; fi; }
