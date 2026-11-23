@@ -7,9 +7,15 @@
 # listed there is a workflow that exists. The checks are set with
 # GITHUB_TOKEN, whose `status` and `check_suite` events start no workflow, so
 # a producer missing from the list leaves a pull request open with every
-# check green. Also checks that every file a failure of the VM tests names is
-# uploaded by the job of vm-tests.yml that runs the script (#110). Reads the
-# YAML files and the scripts only; needs PyYAML.
+# check green. A workflow that runs on workflow_run itself names no pull
+# request in its own run, so it calls automerge's reusable workflow instead
+# of being listed (#51). Also checks that no workflow running the pull
+# request's own code (pull_request) writes a required commit status, that
+# the workflows running as develop has them (pull_request_target,
+# workflow_run) check out no code and keep the event out of their scripts
+# (#51), and that every file a failure of the VM tests names is uploaded by
+# the job of vm-tests.yml that runs the script (#110). Reads the YAML files
+# and the scripts only; needs PyYAML.
 #
 # Usage: tests/unit/workflows.sh
 set -uo pipefail
@@ -52,14 +58,21 @@ if "completed" in types:
     print("ok automerge runs when a listed workflow has completed")
 else:
     print("FAIL automerge's workflow_run trigger lacks the type completed")
-# The job's condition must let through the runs of a pull request: ci and
-# vm-tests run on pull_request, vm-gate on pull_request_target.
+# The job's condition must let through the runs of a pull request: ci runs
+# on pull_request, vm-gate on pull_request_target.
 condition = str((automerge_doc["jobs"]["automerge"]).get("if", ""))
 for event in ("pull_request", "pull_request_target"):
     if not condition or f"== '{event}'" in condition:
         print(f"ok automerge takes a workflow_run of a {event} event")
     else:
         print(f"FAIL automerge's condition drops a workflow_run of a {event} event")
+
+automerge_uses = str(automerge_doc["jobs"]["automerge"].get("uses", ""))
+
+# Transition (#51): vm-tests.yml still posts vm-gate from its report job
+# until vm-gate-finalize.yml is on develop; the follow-up of #51 removes
+# that step and this entry.
+transitional = {"vm-tests.yml": "vm-gate"}
 
 names = set()
 produced = set()
@@ -72,16 +85,86 @@ for path in sorted(workflows.glob("*.y*ml")):
     name = doc.get("name", f".github/workflows/{path.name}")
     names.add(name)
     jobs = doc.get("jobs") or {}
+    on = triggers(doc)
+    if isinstance(on, (str, list)):
+        on = {e: None for e in ([on] if isinstance(on, str) else on)}
+    # A required check is a job of that name (a check run of the job itself)
+    # or a commit status the workflow posts with context=.
+    statuses = [c for c in contexts
+                if re.search(r"context\\?[\"']?\s*[=:]\s*\\?[\"']?" + re.escape(c) + r"(?![\w-])", text)]
     sets = [c for c in contexts
             if any((job or {}).get("name", job_id) == c for job_id, job in jobs.items())
-            or re.search(r"context=[\"']?" + re.escape(c) + r"(?![\w-])", text)]
+            or c in statuses]
+    if path.name in transitional and transitional[path.name] not in statuses:
+        print(f"FAIL {path.name} no longer posts {transitional[path.name]}: "
+              "remove its transitional entry")
+    for c in statuses:
+        # Only pull_request_target and workflow_run run as develop has them.
+        # pull_request, push or workflow_dispatch on a branch, and a
+        # workflow_call from one of those run the branch's own file, which
+        # could post the required status with whatever state it likes (#51).
+        foreign = sorted(set(on) - {"pull_request_target", "workflow_run"})
+        if transitional.get(path.name) == c:
+            print(f"ok {path.name} ({name}) posts {c} as the transitional writer of #51")
+        elif foreign:
+            print(f"FAIL {path.name} ({name}) posts the required status {c} and runs on "
+                  f"{', '.join(foreign)}, as the branch has it")
+        else:
+            print(f"ok {path.name} ({name}) posts the required status {c} and runs as develop has it")
     for c in sets:
         produced.add(c)
-        if name in listened:
+        if transitional.get(path.name) == c:
+            continue
+        if "workflow_run" in on:
+            # Only a pull request's run of vm-tests.yml itself, not a push,
+            # a run by hand or another file named like it, may set it.
+            watched = (on.get("workflow_run") or {}).get("workflows") or []
+            paths = [f".github/workflows/{p.name}" for p in workflows.glob("*.y*ml")
+                     if (yaml.safe_load(p.read_text()) or {}).get("name") in watched]
+            guarded = [job_id for job_id, job in jobs.items()
+                       if re.search(r"context=" + re.escape(c) + r"(?![\w-])", str((job or {}).get("steps", "")))
+                       and "github.event.workflow_run.event == 'pull_request'" in str(job.get("if", ""))
+                       and any(f"github.event.workflow_run.path == '{p}'" in str(job.get("if", ""))
+                               for p in paths)]
+            if guarded:
+                print(f"ok {path.name} ({name}) sets {c} only for a pull request's run "
+                      f"of a named workflow file ({guarded[0]})")
+            else:
+                print(f"FAIL {path.name} ({name}) runs on workflow_run and sets {c}, but the job's "
+                      "condition does not require workflow_run.event pull_request and its path")
+            calls = [job_id for job_id, job in jobs.items()
+                     if str((job or {}).get("uses", "")) == automerge_uses and job.get("needs")]
+            if calls:
+                print(f"ok {path.name} ({name}) runs on workflow_run, sets {c} and "
+                      f"calls automerge's reusable workflow after it ({calls[0]})")
+            else:
+                print(f"FAIL {path.name} ({name}) runs on workflow_run and sets {c}, but no "
+                      "job of it calls automerge's reusable workflow after that")
+        elif name in listened:
             print(f"ok {path.name} ({name}) sets {c} and automerge listens for it")
         else:
             print(f"FAIL {path.name} ({name}) sets the required check {c}, "
                   "but automerge.yaml does not list it under workflow_run")
+    # A workflow on pull_request_target or workflow_run runs with develop's
+    # token on a pull request's event: it checks out no code, and the
+    # event's fields reach its scripts through env only.
+    if "pull_request_target" in on or "workflow_run" in on:
+        steps = [s for job in jobs.values() for s in ((job or {}).get("steps") or [])]
+        # Code or artifacts of the pull request: a checkout, a fetch, or the
+        # artifacts of the triggering run (artifact poisoning).
+        fetches = [s for s in steps
+                   if str(s.get("uses", "")).startswith(("actions/checkout@", "actions/download-artifact@"))
+                   or re.search(r"\b(gh (run download|pr checkout)|git (clone|fetch))\b", str(s.get("run", "")))]
+        if fetches:
+            print(f"FAIL {path.name} ({name}) runs as develop has it and fetches code or artifacts")
+        else:
+            print(f"ok {path.name} ({name}) runs as develop has it and fetches no code or artifacts")
+        if any("${{" in str(s.get("run", "")) or "${{" in str((s.get("with") or {}).get("script", ""))
+               for s in steps):
+            print(f"FAIL {path.name} ({name}) runs as develop has it and expands an "
+                  "expression inside a script")
+        else:
+            print(f"ok {path.name} ({name}) runs as develop has it and passes the event through env")
 
 for c in contexts:
     if c not in produced:
